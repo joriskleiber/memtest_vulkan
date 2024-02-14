@@ -34,112 +34,111 @@ static LAYER_KHRONOS_VALIDATION_ARRAY: CStrStaticPtr =
 const GB: f32 = (1024 * 1024 * 1024) as f32;
 const READ_SHADER: &[u32] = memtest_vulkan_build::compiled_vk_compute_spirv!(
     r#"
-struct IOBuf
-{
-    err_bit1_idx: array<u32, 32>,
-    err_bitcount: array<u32, 32>,
-    mem_bitcount: array<u32, 32>,
-    actual_ff: u32,
-    actual_max: u32,
-    actual_min: u32,
-    idx_max: u32,
-    idx_min: u32,
-    done_iter_or_err: u32,
-    iter: u32,
-    calc_param: u32,
-    first_elem: vec4<u32>
-}
+        struct IOBuf
+        {
+            err_bit1_idx: array<atomic<u32>, 32>,
+            err_bitcount: array<atomic<u32>, 32>,
+            mem_bitcount: array<atomic<u32>, 32>,
+            actual_ff: atomic<u32>,
+            actual_max: atomic<u32>,
+            actual_min: atomic<u32>,
+            idx_max: atomic<u32>,
+            idx_min: atomic<u32>,
+            done_iter_or_err: atomic<u32>,
+            iter: u32,
+            calc_param: u32,
+            first_elem: vec4<u32>
+        }
 
-@group(0) @binding(0) var<storage, read_write> io: IOBuf;
-@group(0) @binding(1) var<storage, read_write> test: array<vec4<u32>>;
+        @group(0) @binding(0) var<storage, read_write> io: IOBuf;
+        @group(0) @binding(1) var<storage, read_write> test: array<vec4<u32>>;
 
-fn addr_value_by_index(i:u32)->vec4<u32>
-{
-    let effective_index_of_u32 = i * 4u + io.calc_param;
-    return vec4<u32>(effective_index_of_u32 + 1u, effective_index_of_u32 + 2u, effective_index_of_u32 + 3u, effective_index_of_u32 + 4u);
-}
+        fn addr_value_by_index(i:u32)->vec4<u32>
+        {
+            let effective_index_of_u32 = i * 4u + io.calc_param;
+            return vec4<u32>(effective_index_of_u32 + 1u, effective_index_of_u32 + 2u, effective_index_of_u32 + 3u, effective_index_of_u32 + 4u);
+        }
 
-fn test_value_by_index(i:u32)->vec4<u32>
-{
-    let addrs : vec4<u32> = addr_value_by_index(i);
-    let shifts : vec4<u32> = addrs % 31u;
-    let rotated : vec4<u32> = (addrs << shifts) | (addrs >> (32u - shifts));
-    return rotated;
-}
+        fn test_value_by_index(i:u32)->vec4<u32>
+        {
+            let addrs : vec4<u32> = addr_value_by_index(i);
+            let shifts : vec4<u32> = addrs % 31u;
+            let rotated : vec4<u32> = (addrs << shifts) | (addrs >> (32u - shifts));
+            return rotated;
+        }
 
+        const TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
+        const TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
 
-let TEST_WINDOW_1D_MAX_GROUPS: u32 = 0x4000u;
-let TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY: u32 = 0x2000u;//don't inner-multiply by window size
-
-@compute @workgroup_size(64, 1, 1)
-fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    let addr_mod = effective_invocation_id % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
-    let new_mod = (11 * effective_invocation_id + 999 * io.iter + io.calc_param +  7 * (effective_invocation_id / TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY)) % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
-    let effective_addr = effective_invocation_id - addr_mod + new_mod; //make read order a bit rotated, not strictly sequential
-    let actual_value : vec4<u32> = test[effective_addr];
-    let expected_value : vec4<u32> = test_value_by_index(effective_addr);
-    if any(actual_value != expected_value) {
-        //slow path, executed only on errors found
-        for(var i: i32 = 0; i < 4; i++) {
-            let actual_u32 = actual_value[i];
-            let error_mask = actual_u32 ^ expected_value[i];
-            if error_mask == 0 {
-                continue;
+        @compute @workgroup_size(64, 1, 1)
+        fn read(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+            let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
+            let addr_mod = effective_invocation_id % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
+            let new_mod = (11 * effective_invocation_id + 999 * io.iter + io.calc_param +  7 * (effective_invocation_id / TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY)) % TEST_WINDOW_READ_ADDR_ROTATION_GRANULARITY;
+            let effective_addr = effective_invocation_id - addr_mod + new_mod; //make read order a bit rotated, not strictly sequential
+            let actual_value : vec4<u32> = test[effective_addr];
+            let expected_value : vec4<u32> = test_value_by_index(effective_addr);
+            if any(actual_value != expected_value) {
+                //slow path, executed only on errors found
+                for(var i: u32 = 0; i < 4; i++) {
+                    let actual_u32 = actual_value[i];
+                    let error_mask = actual_u32 ^ expected_value[i];
+                    if error_mask == 0 {
+                        continue;
+                    }
+                    let one_bits = countOneBits(error_mask);
+                    if one_bits == 1
+                    {
+                        let bit_idx = firstLeadingBit(error_mask);
+                        atomicAdd(&io.err_bit1_idx[bit_idx], 1u);
+                    }
+                    atomicAdd(&io.err_bitcount[one_bits % 32u], 1u);
+                    let vec_addr: u32 = effective_addr * 4u + i;
+                    atomicMax(&io.idx_max, vec_addr);
+                    atomicMin(&io.idx_min, vec_addr);
+                    atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
+                    let actual_bits = countOneBits(actual_u32);
+                    if actual_bits == 32
+                    {
+                        atomicAdd(&io.actual_ff, 1u);
+                    }
+                    else
+                    {
+                        atomicAdd(&io.mem_bitcount[actual_bits], 1u);
+                        atomicMax(&io.actual_max, actual_u32);
+                        atomicMin(&io.actual_min, actual_u32);
+                    }
+                }
             }
-            let one_bits = countOneBits(error_mask);
-            if one_bits == 1
-            {
-                let bit_idx = firstLeadingBit(error_mask);
-                atomicAdd(&io.err_bit1_idx[bit_idx], 1u);
-            }
-            atomicAdd(&io.err_bitcount[one_bits % 32u], 1u);
-            let vec_addr: u32 = effective_addr * 4u + i;
-            atomicMax(&io.idx_max, vec_addr);
-            atomicMin(&io.idx_min, vec_addr);
-            atomicMax(&io.done_iter_or_err, 0xFFFFFFFFu); //ERROR_STATUS
-            let actual_bits = countOneBits(actual_u32);
-            if actual_bits == 32
-            {
-                atomicAdd(&io.actual_ff, 1u);
-            }
-            else
-            {
-                atomicAdd(&io.mem_bitcount[actual_bits], 1u);
-                atomicMax(&io.actual_max, actual_u32);
-                atomicMin(&io.actual_min, actual_u32);
+            //assign done_iter_or_err only on specific index (performance reasons)
+            if effective_addr == 0 {
+                atomicMax(&io.done_iter_or_err, io.iter);
+            } else if effective_addr == 1 {
+                io.first_elem = expected_value;
             }
         }
-    }
-    //assign done_iter_or_err only on specific index (performance reasons)
-    if effective_addr == 0 {
-        atomicMax(&io.done_iter_or_err, io.iter);
-    } else if effective_addr == 1 {
-        io.first_elem = expected_value;
-    }
-}
 
-@compute @workgroup_size(64, 1, 1)
-fn write(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    //make global_invocation_id processing specific memory addr different on writing compared to reading
-    let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
-    let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
-    let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
-    test[proccessed_idx] = test_value_by_index(proccessed_idx);
-}
+        @compute @workgroup_size(64, 1, 1)
+        fn write(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+            let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
+            //make global_invocation_id processing specific memory addr different on writing compared to reading
+            let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
+            let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
+            let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
+            test[proccessed_idx] = test_value_by_index(proccessed_idx);
+        }
 
-@compute @workgroup_size(64, 1, 1)
-fn emulate_write_bugs(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
-    let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
-    let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
-    let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
-    let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
-    test[proccessed_idx] = test_value_by_index(proccessed_idx);
-    if proccessed_idx == 0xADBA {
-        test[proccessed_idx][1] ^= 0x400000u;//error simulation for test
-    }
-}
+        @compute @workgroup_size(64, 1, 1)
+        fn emulate_write_bugs(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
+            let effective_invocation_id: u32 = global_invocation_id[0] + global_invocation_id[1] * TEST_WINDOW_1D_MAX_GROUPS;
+            let TEST_WINDOW_SIZE_GRANULARITY: u32 = 64u * 8u * TEST_WINDOW_1D_MAX_GROUPS;//don't inner-multiply by window size
+            let proccessed_mod = effective_invocation_id % TEST_WINDOW_SIZE_GRANULARITY;
+            let proccessed_idx = effective_invocation_id + TEST_WINDOW_SIZE_GRANULARITY - 2 * proccessed_mod - 1;
+            test[proccessed_idx] = test_value_by_index(proccessed_idx);
+            if proccessed_idx == 0xADBA {
+                test[proccessed_idx][1] ^= 0x400000u;//error simulation for test
+            }
+        }
 "#
 );
 

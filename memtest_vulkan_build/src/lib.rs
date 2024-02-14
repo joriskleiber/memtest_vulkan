@@ -5,11 +5,11 @@ struct InlineSpirV(TokenStream);
 
 fn naga_compile(src: &str) -> Result<Vec<u32>, String> {
     use naga::{
-        front::wgsl::Parser,
+        front::wgsl::Frontend,
         valid::{Capabilities, ValidationFlags, Validator},
     };
 
-    let module = Parser::new().parse(src);
+    let module = Frontend::new().parse(src);
     let module = module.map_err(|e| e.emit_to_string(src))?;
 
     let opts = naga::back::spv::Options {
